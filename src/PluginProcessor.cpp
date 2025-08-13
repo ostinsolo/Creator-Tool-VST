@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "Logging.h"
 
 CreatorToolVSTAudioProcessor::CreatorToolVSTAudioProcessor()
     : juce::AudioProcessor(BusesProperties()
@@ -46,6 +47,11 @@ void CreatorToolVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer
 
     if (audioRecorder.isRecording())
         audioRecorder.pushBuffer(buffer, buffer.getNumSamples());
+
+    // Feed combined A+V recorder if active
+    if (screenRecorder.isRecording()) {
+        screenRecorder.pushAudio(buffer, buffer.getNumSamples(), currentSampleRate, getTotalNumInputChannels());
+    }
 }
 
 juce::AudioProcessorEditor* CreatorToolVSTAudioProcessor::createEditor() {
@@ -91,4 +97,10 @@ void CreatorToolVSTAudioProcessor::stopRecording() {
 
 void CreatorToolVSTAudioProcessor::setDestinationDirectory(const juce::File& dir) {
     destinationDirectory = dir;
+}
+
+//==============================================================================
+// This is the factory method JUCE uses to create the plugin instance
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter() {
+    return new CreatorToolVSTAudioProcessor();
 }

@@ -1,14 +1,26 @@
 #pragma once
 #include <juce_core/juce_core.h>
+#include <juce_audio_basics/juce_audio_basics.h>
 
 class ScreenRecorder {
 public:
     ScreenRecorder();
     ~ScreenRecorder();
 
+    // Legacy video-only start (fallback path)
     bool startRecording(const juce::File& outputFile);
+
+    // Combined audio+video single-writer start (preferred)
+    bool startCombined(const juce::File& outputFile, double sampleRate, int numChannels);
+
     void stop();
     bool isRecording() const;
+
+    // Feed audio from processBlock when combined is active
+    void pushAudio(const juce::AudioBuffer<float>& buffer, int numSamples, double sampleRate, int numChannels);
+
+    // Set desired capture resolution (width x height)
+    void setCaptureResolution(int width, int height);
 
     juce::File getLastRecordedFile() const { return lastRecordedFile; }
 

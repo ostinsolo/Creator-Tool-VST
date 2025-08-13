@@ -1,15 +1,32 @@
 #include "PluginEditor.h"
 #include "PluginProcessor.h"
+#include "MuxUtils.h"
+#include <chrono>
+#include <ctime>
 
 static juce::String makeTimestampedFilename(const juce::String& ext) {
-    auto now = juce::Time::getCurrentTime();
-    return now.formatted("yyyy-MM-dd_HH-mm-ss") + "." + ext;
+    using namespace std::chrono;
+    auto tp = system_clock::now();
+    auto t  = system_clock::to_time_t(tp);
+    std::tm tmval{};
+   #if JUCE_WINDOWS
+    localtime_s(&tmval, &t);
+   #else
+    localtime_r(&t, &tmval);
+   #endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d_%H-%M-%S", &tmval);
+    // add milliseconds to avoid collisions within the same second
+    auto ms = duration_cast<milliseconds>(tp.time_since_epoch()) % 1000;
+    char finalBuf[48];
+    std::snprintf(finalBuf, sizeof(finalBuf), "%s_%03d.%s", buf, (int) ms.count(), ext.toRawUTF8());
+    return juce::String(finalBuf);
 }
 
 CreatorToolVSTAudioProcessorEditor::CreatorToolVSTAudioProcessorEditor(CreatorToolVSTAudioProcessor& p)
     : juce::AudioProcessorEditor(&p), processor(p)
 {
-    setSize(560, 240);
+    setSize(560, 420);
 
     addAndMakeVisible(recordButton);
     addAndMakeVisible(stopButton);
@@ -19,8 +36,22 @@ CreatorToolVSTAudioProcessorEditor::CreatorToolVSTAudioProcessorEditor(CreatorTo
     addAndMakeVisible(screenRecordButton);
     addAndMakeVisible(screenStopButton);
 
+    addAndMakeVisible(bothRecordButton);
+    addAndMakeVisible(bothStopButton);
+
+    resolutionBox.addItem("Auto", 1);
+    resolutionBox.addItem("1280 x 720", 2);
+    resolutionBox.addItem("1920 x 1080", 3);
+    resolutionBox.addItem("2560 x 1440", 4);
+    resolutionBox.addItem("3840 x 2160", 5);
+    resolutionBox.setSelectedId(1, juce::dontSendNotification);
+    resolutionBox.addListener(this);
+    addAndMakeVisible(resolutionBox);
+
     addAndMakeVisible(folderLabel);
     addAndMakeVisible(statusLabel);
+
+    addAndMakeVisible(video);
 
     recordButton.onClick = [this]() { buttonClicked(&recordButton); };
     stopButton.onClick = [this]() { buttonClicked(&stopButton); };
@@ -29,6 +60,9 @@ CreatorToolVSTAudioProcessorEditor::CreatorToolVSTAudioProcessorEditor(CreatorTo
 
     screenRecordButton.onClick = [this]() { buttonClicked(&screenRecordButton); };
     screenStopButton.onClick = [this]() { buttonClicked(&screenStopButton); };
+
+    bothRecordButton.onClick = [this]() { buttonClicked(&bothRecordButton); };
+    bothStopButton.onClick = [this]() { buttonClicked(&bothStopButton); };
 
     folderLabel.setJustificationType(juce::Justification::centred);
     statusLabel.setJustificationType(juce::Justification::centred);
@@ -50,30 +84,59 @@ void CreatorToolVSTAudioProcessorEditor::resized() {
     auto area = getLocalBounds().reduced(12);
     area.removeFromTop(28);
 
-    auto buttonsRow = area.removeFromTop(40);
-    recordButton.setBounds(buttonsRow.removeFromLeft(100).reduced(4));
-    stopButton.setBounds(buttonsRow.removeFromLeft(100).reduced(4));
-    previewButton.setBounds(buttonsRow.removeFromLeft(120).reduced(4));
+    auto buttonsRow = area.removeFromTop(36);
+    recordButton.setBounds(buttonsRow.removeFromLeft(90).reduced(2));
+    stopButton.setBounds(buttonsRow.removeFromLeft(90).reduced(2));
+    previewButton.setBounds(buttonsRow.removeFromLeft(110).reduced(2));
 
-    auto screenRow = area.removeFromTop(40);
-    screenRecordButton.setBounds(screenRow.removeFromLeft(120).reduced(4));
-    screenStopButton.setBounds(screenRow.removeFromLeft(120).reduced(4));
+    auto screenRow = area.removeFromTop(36);
+    screenRecordButton.setBounds(screenRow.removeFromLeft(110).reduced(2));
+    screenStopButton.setBounds(screenRow.removeFromLeft(110).reduced(2));
 
-    area.removeFromTop(10);
+    auto bothRow = area.removeFromTop(36);
+    bothRecordButton.setBounds(bothRow.removeFromLeft(110).reduced(2));
+    bothStopButton.setBounds(bothRow.removeFromLeft(110).reduced(2));
+
+    auto optsRow = area.removeFromTop(36);
+    resolutionBox.setBounds(optsRow.removeFromLeft(180).reduced(2));
+
+    area.removeFromTop(6);
 
     chooseFolderButton.setBounds(area.removeFromTop(36).removeFromLeft(160).reduced(4));
 
-    folderLabel.setBounds(area.removeFromTop(32));
-    statusLabel.setBounds(area.removeFromTop(32));
+    folderLabel.setBounds(area.removeFromTop(24));
+    statusLabel.setBounds(area.removeFromTop(24));
+
+    video.setBounds(area.removeFromTop(160));
+}
+
+void CreatorToolVSTAudioProcessorEditor::comboBoxChanged(juce::ComboBox* box) {
+    if (box != &resolutionBox) return;
+    switch (resolutionBox.getSelectedId()) {
+        case 1: processor.setCaptureResolution(0, 0); break; // auto
+        case 2: processor.setCaptureResolution(1280, 720); break;
+        case 3: processor.setCaptureResolution(1920, 1080); break;
+        case 4: processor.setCaptureResolution(2560, 1440); break;
+        case 5: processor.setCaptureResolution(3840, 2160); break;
+        default: break;
+    }
 }
 
 void CreatorToolVSTAudioProcessorEditor::buttonClicked(juce::Button* button) {
     if (button == &chooseFolderButton) {
-        juce::FileChooser chooser("Choose destination folder", processor.getDestinationDirectory(), juce::String(), true);
-        if (chooser.browseForDirectory()) {
-            processor.setDestinationDirectory(chooser.getResult());
-            updateFolderLabel();
-        }
+        auto chooser = std::make_shared<juce::FileChooser>(
+            "Choose destination folder",
+            processor.getDestinationDirectory(),
+            juce::String(), true);
+
+        chooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
+            [this, chooser](const juce::FileChooser& fc) {
+                juce::File result = fc.getResult();
+                if (result.isDirectory()) {
+                    processor.setDestinationDirectory(result);
+                    updateFolderLabel();
+                }
+            });
         return;
     }
 
@@ -111,6 +174,7 @@ void CreatorToolVSTAudioProcessorEditor::buttonClicked(juce::Button* button) {
         auto target = dir.getChildFile("Screen-" + makeTimestampedFilename("mov"));
         if (processor.startScreenRecording(target)) {
             statusLabel.setText("Screen recording…", juce::dontSendNotification);
+            video.closeVideo();
         } else {
             statusLabel.setText("Failed to start screen recording", juce::dontSendNotification);
         }
@@ -127,6 +191,35 @@ void CreatorToolVSTAudioProcessorEditor::buttonClicked(juce::Button* button) {
         updateButtons();
         return;
     }
+
+    if (button == &bothRecordButton) {
+       #if JUCE_MAC
+        auto dir = processor.getDestinationDirectory();
+        if (! dir.exists()) dir.createDirectory();
+        auto out = dir.getChildFile("AV-" + makeTimestampedFilename("mov"));
+        if (processor.startCombinedRecording(out)) {
+            statusLabel.setText("Recording A+V…", juce::dontSendNotification);
+            video.closeVideo();
+        } else {
+            statusLabel.setText("Failed to start A+V", juce::dontSendNotification);
+        }
+       #else
+        statusLabel.setText("A+V not supported on this platform", juce::dontSendNotification);
+       #endif
+        updateButtons();
+        return;
+    }
+
+    if (button == &bothStopButton) {
+       #if JUCE_MAC
+        processor.stopCombinedRecording();
+        statusLabel.setText("Stopped A+V.", juce::dontSendNotification);
+       #else
+        statusLabel.setText("A+V not supported on this platform", juce::dontSendNotification);
+       #endif
+        updateButtons();
+        return;
+    }
 }
 
 void CreatorToolVSTAudioProcessorEditor::updateButtons() {
@@ -138,9 +231,14 @@ void CreatorToolVSTAudioProcessorEditor::updateButtons() {
     const bool isScreenRec = processor.isScreenRecording();
     screenRecordButton.setEnabled(! isScreenRec);
     screenStopButton.setEnabled(isScreenRec);
+    // A+V is driven by screen recorder combined path, so mirror screenRec state
+    bothRecordButton.setEnabled(! isScreenRec);
+    bothStopButton.setEnabled(isScreenRec);
     #else
     screenRecordButton.setEnabled(false);
     screenStopButton.setEnabled(false);
+    bothRecordButton.setEnabled(false);
+    bothStopButton.setEnabled(false);
     #endif
 
     previewButton.setEnabled(processor.getLastRecordedFile().existsAsFile());

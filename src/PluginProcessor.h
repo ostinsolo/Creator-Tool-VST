@@ -37,15 +37,20 @@ public:
     void getStateInformation(juce::MemoryBlock& destData) override;
     void setStateInformation(const void* data, int sizeInBytes) override;
 
-    // Recording controls
+    // Audio-only recording
     bool startRecordingToFile(const juce::File& file);
     void stopRecording();
     bool isRecording() const { return audioRecorder.isRecording(); }
 
-    // Screen recording controls (macOS)
+    // Video-only (legacy) and combined A+V
     bool startScreenRecording(const juce::File& file) { return screenRecorder.startRecording(file); }
+    bool startCombinedRecording(const juce::File& file) { return screenRecorder.startCombined(file, currentSampleRate, getTotalNumInputChannels()); }
     void stopScreenRecording() { screenRecorder.stop(); }
+    void stopCombinedRecording() { screenRecorder.stop(); }
     bool isScreenRecording() const { return screenRecorder.isRecording(); }
+
+    // Capture options
+    void setCaptureResolution(int width, int height) { screenRecorder.setCaptureResolution(width, height); }
 
     void setDestinationDirectory(const juce::File& dir);
     juce::File getDestinationDirectory() const { return destinationDirectory; }
