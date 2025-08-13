@@ -73,6 +73,7 @@ struct ScreenRecorder::Impl {
     std::unique_ptr<juce::AbstractFifo> audioFifo;
     juce::HeapBlock<int16_t> audioRing;
     int audioRingCapacityFrames { 0 };
+    bool useMp4Container { false };
 
     struct AudioDrainThread : public juce::Thread {
         Impl& owner;
@@ -208,7 +209,10 @@ struct ScreenRecorder::Impl {
         NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String: outFile.getFullPathName().toRawUTF8()]];
         [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
         LogMessage("SCK: creating AVAssetWriter -> " + juce::String(outFile.getFullPathName()));
-        writer = [[AVAssetWriter alloc] initWithURL:url fileType:AVFileTypeQuickTimeMovie error:&err];
+        // Choose container based on file extension
+        useMp4Container = outFile.hasFileExtension("mp4");
+        AVFileType fileType = useMp4Container ? AVFileTypeMPEG4 : AVFileTypeQuickTimeMovie;
+        writer = [[AVAssetWriter alloc] initWithURL:url fileType:fileType error:&err];
         if (err) { LogMessage("SCK: AVAssetWriter init error -> " + juce::String([[err localizedDescription] UTF8String])); return false; }
 
         NSDictionary* vidSettings = @{ AVVideoCodecKey: AVVideoCodecTypeH264,
@@ -220,13 +224,23 @@ struct ScreenRecorder::Impl {
         if ([writer canAddInput:videoInput]) [writer addInput:videoInput]; else { LogMessage("SCK: cannot add video input"); return false; }
 
         if (sampleRate > 0 && numChannels > 0) {
-            NSDictionary* audSettings = @{ AVFormatIDKey: @(kAudioFormatLinearPCM),
-                                            AVSampleRateKey: @(sampleRate),
-                                            AVNumberOfChannelsKey: @(numChannels),
-                                            AVLinearPCMBitDepthKey: @16,
-                                            AVLinearPCMIsFloatKey: @NO,
-                                            AVLinearPCMIsBigEndianKey: @NO,
-                                            AVLinearPCMIsNonInterleaved: @NO };
+            NSDictionary* audSettings = nil;
+            if (useMp4Container) {
+                // AAC for MP4
+                audSettings = @{ AVFormatIDKey: @(kAudioFormatMPEG4AAC),
+                                  AVSampleRateKey: @(sampleRate),
+                                  AVNumberOfChannelsKey: @(numChannels),
+                                  AVEncoderBitRateKey: @(192000) };
+            } else {
+                // 16-bit PCM for MOV
+                audSettings = @{ AVFormatIDKey: @(kAudioFormatLinearPCM),
+                                  AVSampleRateKey: @(sampleRate),
+                                  AVNumberOfChannelsKey: @(numChannels),
+                                  AVLinearPCMBitDepthKey: @16,
+                                  AVLinearPCMIsFloatKey: @NO,
+                                  AVLinearPCMIsBigEndianKey: @NO,
+                                  AVLinearPCMIsNonInterleaved: @NO };
+            }
             audioInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeAudio outputSettings:audSettings];
             audioInput.expectsMediaDataInRealTime = YES;
             if ([writer canAddInput:audioInput]) [writer addInput:audioInput]; else { LogMessage("SCK: cannot add audio input"); }
@@ -266,7 +280,7 @@ struct ScreenRecorder::Impl {
         if (err) { LogMessage("SCK: addStreamOutput error -> " + juce::String([[err localizedDescription] UTF8String])); return false; }
         LogMessage("SCK: addStreamOutput OK");
         if (!setupWriter(outFile, (int)cfg.width, (int)cfg.height, sampleRate, numChannels)) return false;
-        LogMessage("SCK: writer configured (audio=" + juce::String(sampleRate > 0.0 && numChannels > 0 ? "yes" : "no") + ")");
+        LogMessage("SCK: writer configured (container=" + juce::String(useMp4Container ? "mp4" : "mov") + ", audio=" + juce::String(sampleRate > 0.0 && numChannels > 0 ? "yes" : "no") + ")");
         combined.store(sampleRate > 0.0 && numChannels > 0);
         combinedSampleRate = sampleRate;
         combinedNumChannels = (numChannels > 0 ? numChannels : 2);

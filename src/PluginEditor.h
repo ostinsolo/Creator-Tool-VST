@@ -34,6 +34,7 @@ private:
     juce::TextButton bothStopButton { "Stop A+V" };
 
     juce::ComboBox resolutionBox;
+    juce::ComboBox formatBox; // MOV/MP4
 
     juce::Label folderLabel;
     juce::Label statusLabel;

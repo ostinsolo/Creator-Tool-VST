@@ -4,6 +4,14 @@ project(CreatorToolVST VERSION 0.1.0)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Prefer interprocedural optimization for Release if available
+cmake_policy(SET CMP0069 NEW)
+include(CheckIPOSupported)
+check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error)
+if(ipo_supported)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+endif()
+
 # Require a local JUCE checkout
 set(JUCE_LOCAL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/JUCE")
 if(NOT EXISTS "${JUCE_LOCAL_DIR}/CMakeLists.txt")
@@ -64,6 +72,30 @@ target_link_libraries(CreatorToolVST PRIVATE
     juce::juce_video
     juce::juce_dsp
 )
+
+# Platform-specific compile/link options
+if(MSVC)
+    # Windows optimization flags
+    target_compile_options(CreatorToolVST PRIVATE
+        $<$<CONFIG:Release>:/O2 /GL /Gw /Gy>
+        $<$<CONFIG:Debug>:/Zi /Od>
+    )
+    target_link_options(CreatorToolVST PRIVATE
+        $<$<CONFIG:Release>:/LTCG>
+    )
+else()
+    # macOS/Linux
+    target_compile_options(CreatorToolVST PRIVATE
+        $<$<CONFIG:Release>:-O3 -fvisibility=hidden -fvisibility-inlines-hidden>
+        $<$<CONFIG:Debug>:-O0 -g>
+    )
+    # Hide symbols by default; JUCE exports plugin entry points
+    set_target_properties(CreatorToolVST PROPERTIES
+        C_VISIBILITY_PRESET hidden
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+    )
+endif()
 
 if(APPLE)
     # Ensure Objective-C++ with ARC for the ObjC++ sources
