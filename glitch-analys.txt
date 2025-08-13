@@ -1,0 +1,50 @@
+Glitch during A+V capture — root causes and fixes
+
+What you heard
+- Short “tick/click” artifacts and/or brief breakup when starting/recording A+V.
+
+Why it happened (previous implementation)
+1) Heavy work on the audio thread
+- The audio callback was doing allocations and packaging frames directly into CMSampleBuffers for the writer.
+- When the video pipeline (ScreenCaptureKit + AVAssetWriter) wasn’t immediately ready, the audio path briefly blocked or fell behind.
+- Any stall in the audio callback produces audible glitches.
+
+2) Writer backpressure and start latency
+- AVAssetWriter starts its session on the first video frame PTS.
+- Early audio appended before the writer/session fully started either caused delays or got queued under backpressure.
+- Doing this work inside the audio thread increased the chance of timing spikes.
+
+3) Format and layout friction
+- Using 32‑bit float PCM with no explicit channel layout can cause the writer to do internal conversions.
+- Extra conversion work (plus ambiguous mono/stereo layout) increases pressure and may downmix unexpectedly.
+
+4) No decoupling from disk/encoder
+- Without a ring buffer, the audio thread had to keep pace with the writer/encoder.
+- Any transient hiccup on the writer side (e.g., GPU spike while screen encoding) surfaced as audio underruns.
+
+What we changed
+1) Moved audio off the audio thread
+- The audio callback now only interleaves to a lock‑free ring buffer (no allocations).
+- A low‑priority drain thread packages CMSampleBuffers and appends to AVAssetWriter.
+- Result: the audio thread never touches disk/encoder, eliminating stalls.
+
+2) Real‑time friendly audio format
+- Switched to 16‑bit PCM, interleaved, with an explicit channel layout (Mono/Stereo).
+- This reduces conversions inside the writer, preserves panning, and lowers CPU.
+
+3) Proper timestamp alignment
+- Audio PTS is aligned to the first video PTS (baseVideoPTS), so the writer starts cleanly.
+- This avoids early-frame timing jitter during session startup.
+
+4) Backpressure tolerance
+- The ring buffer provides a couple of seconds of headroom.
+- If the writer is momentarily not ready, the drain thread waits; the audio thread continues uninterrupted.
+
+Expected outcome
+- No audible glitches when starting or during A+V capture.
+- Correct stereo panning preserved in the output.
+
+If a glitch reappears
+- Lower capture resolution to reduce GPU/CPU load.
+- Check logs for “cannot add audio input” or repeated start/stop messages.
+- Increase ring buffer length if your sessions use very large blocks or heavy system load.
