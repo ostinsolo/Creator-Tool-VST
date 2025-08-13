@@ -1,0 +1,30 @@
+# Build directories
+/build/
+/build-*/*
+CMakeFiles/
+CMakeCache.txt
+*.cmake
+*.cbp
+*.vcxproj*
+*.xcodeproj/
+*.xcworkspace/
+*.user
+*.DS_Store
+
+# JUCE auto-generated headers
+JuceLibraryCode/
+
+# Plugin binaries copied after build
+*.vst3
+*.component
+*.dll
+*.so
+*.dylib
+*.aaxplugin
+
+# IDE metadata
+.idea/
+.vscode/
+
+# Local settings
+local.env
