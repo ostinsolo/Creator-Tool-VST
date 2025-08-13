@@ -4,20 +4,13 @@ project(CreatorToolVST VERSION 0.1.0)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Prefer a local JUCE checkout if available
+# Require a local JUCE checkout
 set(JUCE_LOCAL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/JUCE")
-if(EXISTS "${JUCE_LOCAL_DIR}/CMakeLists.txt")
-    message(STATUS "Using local JUCE from external/JUCE")
-    add_subdirectory(${JUCE_LOCAL_DIR} ${CMAKE_BINARY_DIR}/juce)
-else()
-    include(FetchContent)
-    FetchContent_Declare(
-        juce
-        GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
-        GIT_TAG 8.0.8
-    )
-    FetchContent_MakeAvailable(juce)
+if(NOT EXISTS "${JUCE_LOCAL_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR "JUCE not found at external/JUCE. Please init/update the submodule: git submodule update --init --recursive")
 endif()
+message(STATUS "Using local JUCE from external/JUCE")
+add_subdirectory(${JUCE_LOCAL_DIR} ${CMAKE_BINARY_DIR}/juce)
 
 juce_add_plugin(CreatorToolVST
     COMPANY_NAME "CreatorTool"
@@ -41,12 +34,17 @@ file(GLOB_RECURSE PLUGIN_SOURCES CONFIGURE_DEPENDS
     "src/*.h"
 )
 
-# Add Objective-C++ file for macOS screen recorder
+# Add Objective-C++ files for macOS screen recorder and mux
 if(APPLE)
     list(APPEND PLUGIN_SOURCES src/ScreenRecorder.mm)
 endif()
 
 target_sources(CreatorToolVST PRIVATE ${PLUGIN_SOURCES})
+
+if(APPLE)
+    # Explicitly add MuxUtils.mm to avoid glob issues
+    target_sources(CreatorToolVST PRIVATE src/MuxUtils.mm)
+endif()
 
 # Definitions and JUCE modules
 
@@ -63,12 +61,16 @@ target_link_libraries(CreatorToolVST PRIVATE
     juce::juce_audio_processors
     juce::juce_gui_basics
     juce::juce_gui_extra
+    juce::juce_video
     juce::juce_dsp
 )
 
 if(APPLE)
-    # Ensure Objective-C++ with ARC for the screen recorder
+    # Ensure Objective-C++ with ARC for the ObjC++ sources
     set_source_files_properties(src/ScreenRecorder.mm PROPERTIES LANGUAGE OBJCXX)
     set_source_files_properties(src/ScreenRecorder.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
-    target_link_libraries(CreatorToolVST PRIVATE "-framework AVFoundation" "-framework AppKit" "-framework CoreMedia")
+    set_source_files_properties(src/MuxUtils.mm PROPERTIES LANGUAGE OBJCXX)
+    set_source_files_properties(src/MuxUtils.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    # Link required frameworks; ScreenCaptureKit provided since macOS 12.3
+    target_link_libraries(CreatorToolVST PRIVATE "-framework AVFoundation" "-framework AppKit" "-framework CoreMedia" "-framework AVKit" "-framework ScreenCaptureKit")
 endif()
