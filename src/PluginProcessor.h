@@ -1,6 +1,13 @@
 #pragma once
-#include <JuceHeader.h>
+#include <juce_audio_processors/juce_audio_processors.h>
+#include <juce_audio_formats/juce_audio_formats.h>
+#include <juce_audio_utils/juce_audio_utils.h>
+#include <juce_gui_basics/juce_gui_basics.h>
+#include <juce_gui_extra/juce_gui_extra.h>
+#include <juce_dsp/juce_dsp.h>
+#include <juce_core/juce_core.h>
 #include "AudioRecorder.h"
+#include "ScreenRecorder.h"
 
 class CreatorToolVSTAudioProcessor : public juce::AudioProcessor {
 public:
@@ -35,12 +42,18 @@ public:
     void stopRecording();
     bool isRecording() const { return audioRecorder.isRecording(); }
 
+    // Screen recording controls (macOS)
+    bool startScreenRecording(const juce::File& file) { return screenRecorder.startRecording(file); }
+    void stopScreenRecording() { screenRecorder.stop(); }
+    bool isScreenRecording() const { return screenRecorder.isRecording(); }
+
     void setDestinationDirectory(const juce::File& dir);
     juce::File getDestinationDirectory() const { return destinationDirectory; }
     juce::File getLastRecordedFile() const { return lastRecordedFile; }
 
 private:
     AudioRecorder audioRecorder;
+    ScreenRecorder screenRecorder;
     juce::File destinationDirectory;
     juce::File lastRecordedFile;
     double currentSampleRate { 44100.0 };
