@@ -49,7 +49,6 @@ struct ScreenRecorder::Impl {
     int combinedNumChannels { 0 };
     int64_t audioSamplesPushed { 0 };
 
-    // Desired capture resolution (0 = auto based on display)
     std::atomic<int> desiredWidth { 0 };
     std::atomic<int> desiredHeight { 0 };
 
@@ -69,6 +68,96 @@ struct ScreenRecorder::Impl {
     dispatch_queue_t writerQueue = nullptr;
     BOOL startedWriting = NO;
     CMTime baseVideoPTS { kCMTimeInvalid };
+
+    // Audio ring buffer and drain thread (int16 interleaved)
+    std::unique_ptr<juce::AbstractFifo> audioFifo;
+    juce::HeapBlock<int16_t> audioRing;
+    int audioRingCapacityFrames { 0 };
+
+    struct AudioDrainThread : public juce::Thread {
+        Impl& owner;
+        explicit AudioDrainThread(Impl& o) : juce::Thread("A+V Audio Drain"), owner(o) {}
+        void run() override {
+            while (! threadShouldExit()) {
+                owner.drainAudioOnce();
+                wait(2);
+            }
+            owner.drainAudioOnce();
+        }
+    };
+    std::unique_ptr<AudioDrainThread> audioDrainThread;
+
+    void startAudioDrain() {
+        if (audioDrainThread) return;
+        audioDrainThread = std::make_unique<AudioDrainThread>(*this);
+       #if JUCE_THREAD_PRIORITIES
+        audioDrainThread->startThread(juce::Thread::Priority::backgroundPriority);
+       #else
+        audioDrainThread->startThread();
+       #endif
+    }
+
+    void stopAudioDrain() {
+        if (audioDrainThread) {
+            audioDrainThread->stopThread(2000);
+            audioDrainThread.reset();
+        }
+    }
+
+    void drainAudioOnce() {
+        if (audioInput == nil || writer == nil || !startedWriting || !combined.load() || audioFifo == nullptr) return;
+        const int channels = combinedNumChannels;
+        if (channels <= 0) return;
+        int start1 = 0, size1 = 0, start2 = 0, size2 = 0;
+        audioFifo->prepareToRead(audioRingCapacityFrames, start1, size1, start2, size2);
+        const auto framesAvail = size1 + size2;
+        if (framesAvail == 0) { audioFifo->finishedRead(0); return; }
+
+        auto appendChunk = [&](int start, int count) {
+            if (count <= 0) return;
+            const size_t frameBytes = sizeof(int16_t) * (size_t)channels;
+            const void* basePtr = audioRing.getData() + (size_t)start * (size_t)channels;
+
+            CMTime audioOffset = CMTIME_IS_VALID(baseVideoPTS) ? baseVideoPTS : kCMTimeZero;
+            CMTime ptsFromStart = CMTimeMake((int64_t)audioSamplesPushed, (int32_t)combinedSampleRate);
+            CMTime pts = CMTIME_IS_VALID(audioOffset) ? CMTimeAdd(audioOffset, ptsFromStart) : ptsFromStart;
+            audioSamplesPushed += count;
+
+            AudioStreamBasicDescription asbd = {0};
+            asbd.mSampleRate = combinedSampleRate;
+            asbd.mFormatID = kAudioFormatLinearPCM;
+            asbd.mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked;
+            asbd.mBitsPerChannel = 16;
+            asbd.mChannelsPerFrame = (UInt32) channels;
+            asbd.mBytesPerFrame = (UInt32)frameBytes;
+            asbd.mFramesPerPacket = 1;
+            asbd.mBytesPerPacket = asbd.mBytesPerFrame * asbd.mFramesPerPacket;
+
+            CMAudioFormatDescriptionRef formatDesc = nullptr;
+            CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &asbd, 0, nullptr, 0, nullptr, nullptr, &formatDesc);
+
+            CMBlockBufferRef blockBuf = nullptr;
+            CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, (void*)basePtr, (size_t)count * asbd.mBytesPerFrame, kCFAllocatorNull, nullptr, 0, (size_t)count * asbd.mBytesPerFrame, 0, &blockBuf);
+
+            CMSampleBufferRef sampleBuf = nullptr;
+            CMSampleTimingInfo timing = { .duration = CMTimeMake(1, (int32_t)combinedSampleRate), .presentationTimeStamp = pts, .decodeTimeStamp = kCMTimeInvalid };
+            CMSampleBufferCreate(kCFAllocatorDefault, blockBuf, true, nullptr, nullptr, formatDesc, (CMItemCount)count, 1, &timing, 0, nullptr, &sampleBuf);
+
+            CFRelease(formatDesc);
+            CFRelease(blockBuf);
+
+            if (sampleBuf) {
+                if ([audioInput isReadyForMoreMediaData]) {
+                    [audioInput appendSampleBuffer:sampleBuf];
+                }
+                CFRelease(sampleBuf);
+            }
+        };
+
+        appendChunk(start1, size1);
+        appendChunk(start2, size2);
+        audioFifo->finishedRead(framesAvail);
+    }
 
     static BOOL handleSample(void* selfPtr, CMSampleBufferRef sbuf) {
         Impl* self = (Impl*) selfPtr;
@@ -177,12 +266,23 @@ struct ScreenRecorder::Impl {
         if (err) { LogMessage("SCK: addStreamOutput error -> " + juce::String([[err localizedDescription] UTF8String])); return false; }
         LogMessage("SCK: addStreamOutput OK");
         if (!setupWriter(outFile, (int)cfg.width, (int)cfg.height, sampleRate, numChannels)) return false;
+        LogMessage("SCK: writer configured (audio=" + juce::String(sampleRate > 0.0 && numChannels > 0 ? "yes" : "no") + ")");
         combined.store(sampleRate > 0.0 && numChannels > 0);
         combinedSampleRate = sampleRate;
         combinedNumChannels = (numChannels > 0 ? numChannels : 2);
         audioSamplesPushed = 0;
         baseVideoPTS = kCMTimeInvalid;
-        running.store(true); // optimistic
+
+        // Init audio ring if combined
+        if (combined.load()) {
+            const int targetFrames = juce::jmax(32768, (int) (2.0 * sampleRate));
+            audioRingCapacityFrames = targetFrames;
+            audioFifo.reset(new juce::AbstractFifo(audioRingCapacityFrames));
+            audioRing.allocate((size_t)audioRingCapacityFrames * (size_t)combinedNumChannels, true);
+            startAudioDrain();
+        }
+
+        running.store(true);
         LogMessage("SCK: startCapture requested -> " + juce::String(outFile.getFileName()));
         [scStream startCaptureWithCompletionHandler:^(NSError * _Nullable error) {
             if (error != nil) { LogMessage("SCK: startCapture error -> " + juce::String([[error localizedDescription] UTF8String])); running.store(false); }
@@ -245,54 +345,30 @@ struct ScreenRecorder::Impl {
     void pushAudio(const juce::AudioBuffer<float>& buffer, int numSamples, double sampleRate, int numChannels) {
     #if HAVE_SCKIT
         juce::ignoreUnused(sampleRate, numChannels);
-        if (!combined.load() || !startedWriting || writer == nil || audioInput == nil) return;
+        if (!combined.load() || writer == nil || audioInput == nil || audioFifo == nullptr) return;
         if (numSamples <= 0) return;
-        const int channelsConfigured = combinedNumChannels;
-        const int chAvailable = juce::jmin(buffer.getNumChannels(), channelsConfigured);
-        const size_t frameBytes = sizeof(int16_t) * (size_t)channelsConfigured;
-        juce::HeapBlock<int16_t> interleaved((size_t)numSamples * (size_t)channelsConfigured);
-        for (int i = 0; i < numSamples; ++i) {
-            for (int c = 0; c < channelsConfigured; ++c) {
-                float f = (c < chAvailable) ? buffer.getReadPointer(c)[i] : 0.0f;
-                f = juce::jlimit(-1.0f, 1.0f, f);
-                int16_t s = (int16_t) juce::roundToInt(f * 32767.0f);
-                interleaved[(size_t)i * (size_t)channelsConfigured + (size_t)c] = s;
-            }
+        const int channels = combinedNumChannels;
+        const int chAvail = juce::jmin(buffer.getNumChannels(), channels);
+        int start1 = 0, size1 = 0, start2 = 0, size2 = 0;
+        audioFifo->prepareToWrite(numSamples, start1, size1, start2, size2);
+        if (size1 + size2 < numSamples) {
+            // drop
+            return;
         }
-        CMTime audioOffset = CMTIME_IS_VALID(baseVideoPTS) ? baseVideoPTS : kCMTimeZero;
-        CMTime ptsFromStart = CMTimeMake((int64_t)audioSamplesPushed, (int32_t)combinedSampleRate);
-        CMTime pts = CMTIME_IS_VALID(audioOffset) ? CMTimeAdd(audioOffset, ptsFromStart) : ptsFromStart;
-        audioSamplesPushed += numSamples;
-
-        AudioStreamBasicDescription asbd = {0};
-        asbd.mSampleRate = combinedSampleRate;
-        asbd.mFormatID = kAudioFormatLinearPCM;
-        asbd.mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked;
-        asbd.mBitsPerChannel = 16;
-        asbd.mChannelsPerFrame = (UInt32) channelsConfigured;
-        asbd.mBytesPerFrame = (UInt32)frameBytes;
-        asbd.mFramesPerPacket = 1;
-        asbd.mBytesPerPacket = asbd.mBytesPerFrame * asbd.mFramesPerPacket;
-
-        CMAudioFormatDescriptionRef formatDesc = nullptr;
-        CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &asbd, 0, nullptr, 0, nullptr, nullptr, &formatDesc);
-
-        CMBlockBufferRef blockBuf = nullptr;
-        CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, interleaved.getData(), (size_t)numSamples * asbd.mBytesPerFrame, kCFAllocatorNull, nullptr, 0, (size_t)numSamples * asbd.mBytesPerFrame, 0, &blockBuf);
-
-        CMSampleBufferRef sampleBuf = nullptr;
-        CMSampleTimingInfo timing = { .duration = CMTimeMake(1, (int32_t)combinedSampleRate), .presentationTimeStamp = pts, .decodeTimeStamp = kCMTimeInvalid };
-        CMSampleBufferCreate(kCFAllocatorDefault, blockBuf, true, nullptr, nullptr, formatDesc, (CMItemCount)numSamples, 1, &timing, 0, nullptr, &sampleBuf);
-
-        CFRelease(formatDesc);
-        CFRelease(blockBuf);
-
-        if (sampleBuf) {
-            if ([audioInput isReadyForMoreMediaData]) {
-                [audioInput appendSampleBuffer:sampleBuf];
+        auto writeChunk = [&](int start, int count, int offsetInBuffer) {
+            if (count <= 0) return;
+            int16_t* dest = audioRing.getData() + ((size_t)start * (size_t)channels);
+            for (int i = 0; i < count; ++i) {
+                for (int c = 0; c < channels; ++c) {
+                    float f = (c < chAvail) ? buffer.getReadPointer(c)[i + offsetInBuffer] : 0.0f;
+                    f = juce::jlimit(-1.0f, 1.0f, f);
+                    dest[i * channels + c] = (int16_t) juce::roundToInt(f * 32767.0f);
+                }
             }
-            CFRelease(sampleBuf);
-        }
+        };
+        writeChunk(start1, size1, 0);
+        writeChunk(start2, size2, size1);
+        audioFifo->finishedWrite(size1 + size2);
     #else
         juce::ignoreUnused(buffer, numSamples, sampleRate, numChannels);
     #endif
@@ -313,6 +389,7 @@ struct ScreenRecorder::Impl {
         if (videoInput != nil) [videoInput markAsFinished];
         if (audioInput != nil) [audioInput markAsFinished];
         if (writer != nil) [writer finishWritingWithCompletionHandler:^{ LogMessage("SCK: writer finished"); }];
+        stopAudioDrain();
         cleanupSCK();
 #endif
     }
@@ -322,7 +399,7 @@ struct ScreenRecorder::Impl {
     }
 #if HAVE_SCKIT
     void cleanupSCK() {
-        scOutput = nil; scStream = nil; videoAdaptor = nil; videoInput = nil; audioInput = nil; writer = nil; startedWriting = NO; baseVideoPTS = kCMTimeInvalid; combined.store(false); audioSamplesPushed = 0; combinedSampleRate = 0.0; combinedNumChannels = 0; if (scQueue) { scQueue = nullptr; } if (writerQueue) { writerQueue = nullptr; }
+        scOutput = nil; scStream = nil; videoAdaptor = nil; videoInput = nil; audioInput = nil; writer = nil; startedWriting = NO; baseVideoPTS = kCMTimeInvalid; combined.store(false); audioSamplesPushed = 0; combinedSampleRate = 0.0; combinedNumChannels = 0; audioFifo.reset(); audioRingCapacityFrames = 0; audioRing.free(); if (scQueue) { scQueue = nullptr; } if (writerQueue) { writerQueue = nullptr; }
     }
 #endif
 
