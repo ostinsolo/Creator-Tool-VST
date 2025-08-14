@@ -28,6 +28,19 @@
 }
 @end
 
+// AVFoundation video data delegate bridge
+@interface AVFVideoDelegate : NSObject<AVCaptureVideoDataOutputSampleBufferDelegate>
+@property (nonatomic, assign) void* cppImplPtr;
+@end
+
+@implementation AVFVideoDelegate
+- (void)captureOutput:(AVCaptureOutput*)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection*)connection {
+    juce::ignoreUnused(output, connection);
+    struct AVFShim { BOOL (*cb)(void*, CMSampleBufferRef); void* selfPtr; };
+    AVFShim* shim = (AVFShim*)_cppImplPtr; if (shim && shim->cb) shim->cb(shim->selfPtr, sampleBuffer);
+}
+@end
+
 #if HAVE_SCKIT
 @interface JUCEStreamOutputBridge : NSObject<SCStreamOutput>
 @property (nonatomic, assign) void* cppImplPtr;
@@ -56,6 +69,9 @@ struct ScreenRecorder::Impl {
     AVCaptureScreenInput* screenInput = nil;
     AVCaptureMovieFileOutput* movieOutput = nil;
     JUCECaptureDelegate* delegate = nil;
+    // AVFoundation stream-only path
+    AVCaptureVideoDataOutput* videoDataOutput = nil;
+    dispatch_queue_t videoDataQueue = nullptr;
 
 #if HAVE_SCKIT
     SCStream* scStream = nil;
@@ -319,7 +335,11 @@ struct ScreenRecorder::Impl {
    #if HAVE_SCKIT
         if (!canUseScreenCaptureKit()) return false;
         SCDisplay* display = pickMainDisplay();
-        if (display == nil) { LogMessage("SCK: no display found"); return false; }
+        if (display == nil) {
+            LogMessage("SCK: no display found");
+            // Fallback to AVFoundation stream-only
+            return startAVFStreamOnly();
+        }
         NSError* err = nil;
         SCStreamConfiguration* cfg = [SCStreamConfiguration new];
         cfg.showsCursor = YES;
@@ -381,6 +401,36 @@ struct ScreenRecorder::Impl {
         NSURL* url = [NSURL fileURLWithPath: nsPath];
         [movieOutput startRecordingToOutputFileURL:url recordingDelegate:delegate];
         running.store(true);
+        return true;
+    }
+
+    bool startAVFStreamOnly() {
+        LogMessage("AVF: start stream-only fallback");
+        session = [[AVCaptureSession alloc] init];
+        screenInput = [[AVCaptureScreenInput alloc] initWithDisplayID:CGMainDisplayID()];
+        if (![session canAddInput:screenInput]) { LogMessage("AVF: cannot add input"); return false; }
+        [session addInput:screenInput];
+
+        videoDataOutput = [[AVCaptureVideoDataOutput alloc] init];
+        // Use native 420f pixel format so VideoToolbox encoder accepts directly
+        NSDictionary* settings = @{ (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) };
+        videoDataOutput.videoSettings = settings;
+        videoDataOutput.alwaysDiscardsLateVideoFrames = YES;
+
+        if (![session canAddOutput:videoDataOutput]) { LogMessage("AVF: cannot add video data output"); return false; }
+        [session addOutput:videoDataOutput];
+
+        // Create ObjC delegate shim
+        id<AVCaptureVideoDataOutputSampleBufferDelegate> del = (id<AVCaptureVideoDataOutputSampleBufferDelegate>)[[AVFVideoDelegate alloc] init];
+        struct AVFShim { BOOL (*cb)(void*, CMSampleBufferRef); void* selfPtr; };
+        AVFShim* shim = (AVFShim*)malloc(sizeof(AVFShim)); shim->cb = &Impl::handleSample; shim->selfPtr = this;
+        ((AVFVideoDelegate*)del).cppImplPtr = shim;
+        videoDataQueue = dispatch_queue_create("avf.video.queue", DISPATCH_QUEUE_SERIAL);
+        [videoDataOutput setSampleBufferDelegate:del queue:videoDataQueue];
+
+        [session startRunning];
+        running.store(true);
+        LogMessage("AVF: stream-only started");
         return true;
     }
 
@@ -464,6 +514,7 @@ struct ScreenRecorder::Impl {
 
     void cleanupAVF() {
         movieOutput = nil; screenInput = nil; session = nil; delegate = nil;
+        videoDataOutput = nil; if (videoDataQueue) { videoDataQueue = nullptr; }
     }
 #if HAVE_SCKIT
     void cleanupSCK() {

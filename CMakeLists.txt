@@ -44,6 +44,8 @@ file(GLOB_RECURSE PLUGIN_SOURCES CONFIGURE_DEPENDS
 
 # Add Objective-C++ files for macOS screen recorder and mux
 if(APPLE)
+    # Resolve CoreVideo path explicitly for reliable linking
+    find_library(COREVIDEO_FRAMEWORK CoreVideo)
     list(APPEND PLUGIN_SOURCES src/ScreenRecorder.mm)
 endif()
 
@@ -112,7 +114,7 @@ if(APPLE)
     set_source_files_properties(src/MuxUtils.mm PROPERTIES LANGUAGE OBJCXX)
     set_source_files_properties(src/MuxUtils.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
     # Link required frameworks; ScreenCaptureKit provided since macOS 12.3
-    target_link_libraries(CreatorToolVST PRIVATE "-framework AVFoundation" "-framework AppKit" "-framework CoreMedia" "-framework AVKit" "-framework ScreenCaptureKit" "-framework VideoToolbox" "-framework AudioToolbox")
+    target_link_libraries(CreatorToolVST PRIVATE "-framework AVFoundation" "-framework AppKit" "-framework CoreMedia" "-framework AVKit" "-framework ScreenCaptureKit" "-framework VideoToolbox" "-framework AudioToolbox" ${COREVIDEO_FRAMEWORK})
 
     # Optional FFmpeg (Pro streaming). Set HAVE_FFMPEG if found.
     find_path(FFMPEG_INCLUDE_DIR libavformat/avformat.h 
@@ -128,7 +130,26 @@ if(APPLE)
         target_include_directories(CreatorToolVST PRIVATE ${FFMPEG_INCLUDE_DIR})
         target_link_libraries(CreatorToolVST PRIVATE ${AVFORMAT_LIBRARY} ${AVUTIL_LIBRARY} ${AVCODEC_LIBRARY})
         message(STATUS "FFmpeg found; enabling Pro RTMP writer")
+
+        # Standalone CLI test app that reuses capture/streaming
+        add_executable(StreamerTest
+            src/LiveStreamer.h
+            src/LiveStreamer.mm
+            src/FfmpegRtmpWriter.h
+            src/FfmpegRtmpWriter.cpp
+            src/ScreenRecorder.h
+            src/ScreenRecorder.mm
+            src/Logging.h
+            tools/StreamerTest.cpp
+        )
+        target_compile_definitions(StreamerTest PRIVATE HAVE_FFMPEG=1)
+        target_include_directories(StreamerTest PRIVATE ${FFMPEG_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/external/JUCE/modules ${CMAKE_CURRENT_BINARY_DIR}/Release/include)
+        set_source_files_properties(src/ScreenRecorder.mm PROPERTIES LANGUAGE OBJCXX)
+        set_source_files_properties(src/ScreenRecorder.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+        target_link_libraries(StreamerTest PRIVATE ${AVFORMAT_LIBRARY} ${AVUTIL_LIBRARY} ${AVCODEC_LIBRARY})
+        target_link_libraries(StreamerTest PRIVATE "-framework AVFoundation" "-framework AppKit" "-framework CoreMedia" "-framework AVKit" "-framework ScreenCaptureKit" "-framework VideoToolbox" "-framework AudioToolbox" ${COREVIDEO_FRAMEWORK} juce::juce_core juce::juce_events)
+        target_compile_options(StreamerTest PRIVATE $<$<CONFIG:Release>:-O3> $<$<CONFIG:Debug>:-O0 -g>)
     else()
-        message(STATUS "FFmpeg not found; Pro RTMP writer disabled")
+        message(STATUS "FFmpeg not found; StreamerTest will not be built")
     endif()
 endif()

@@ -26,6 +26,7 @@ struct streaming::LiveStreamer::Impl {
     bool sentFirstVideo { false };
     juce::HeapBlock<uint8_t> spspps;
     size_t spsppsSize{0};
+    std::atomic<juce::int64> lastVideoSentRelMs { 0 };
 
     // Audio conversion
     AVAudioConverter* converter { nil };
@@ -33,6 +34,61 @@ struct streaming::LiveStreamer::Impl {
     AVAudioFormat* outFmt { nil }; // AAC
     juce::int64 audioPtsMs{0};
     dispatch_queue_t aacQueue { nullptr };
+
+    // Common PTS base (ms) set on first video frame
+    std::atomic<bool> ptsBaseSet { false };
+    std::atomic<juce::int64> basePtsMs { 0 };
+    // Pacing: send encoded frames at real-time rate
+    struct PendingFrame {
+        juce::HeapBlock<uint8_t> bytes;
+        size_t length { 0 };
+        juce::int64 ptsMs { 0 };
+        bool keyframe { false };
+    };
+    std::deque<PendingFrame> pendingFrames;
+    std::mutex pendingMutex;
+    std::atomic<bool> pacingStarted { false };
+    std::chrono::steady_clock::time_point wallStart;
+    dispatch_source_t pacerTimer { nullptr };
+
+    // Audio pacing
+    struct PendingAudio {
+        juce::HeapBlock<uint8_t> bytes;
+        size_t length { 0 };
+        juce::int64 ptsMs { 0 };
+    };
+    std::deque<PendingAudio> pendingAudio;
+    std::mutex audioMutex;
+    std::atomic<bool> audioPacingStarted { false };
+    dispatch_source_t audioTimer { nullptr };
+
+    void startAudioPacingIfNeeded() {
+        if (audioPacingStarted.load()) return;
+        audioTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
+        if (!audioTimer) return;
+        // Fire every ~21ms for 48kHz AAC (1024 samples ≈ 21.33ms)
+        dispatch_source_set_timer(audioTimer, dispatch_time(DISPATCH_TIME_NOW, 0), (uint64_t)(21 * NSEC_PER_MSEC), (uint64_t)(1 * NSEC_PER_MSEC));
+        dispatch_source_set_event_handler(audioTimer, ^{
+            if (!ptsBaseSet.load()) return;
+            auto now = std::chrono::steady_clock::now();
+            juce::int64 elapsedMs = (juce::int64) std::chrono::duration_cast<std::chrono::milliseconds>(now - wallStart).count();
+            int sentThisTick = 0;
+            while (sentThisTick < 2) { // allow up to 2 AAC packets per tick to catch up slightly
+                PendingAudio pa;
+                {
+                    std::lock_guard<std::mutex> lk(audioMutex);
+                    if (pendingAudio.empty()) break;
+                    if (pendingAudio.front().ptsMs > elapsedMs) break; // not yet due
+                    pa = std::move(pendingAudio.front());
+                    pendingAudio.pop_front();
+                }
+                rtmp.writeAudioFrame(pa.bytes.getData(), pa.length, pa.ptsMs);
+                ++sentThisTick;
+            }
+        });
+        dispatch_resume(audioTimer);
+        audioPacingStarted.store(true);
+    }
 #endif
 
     bool openRtmp() {
@@ -52,9 +108,9 @@ struct streaming::LiveStreamer::Impl {
             keyframe = !CFDictionaryContainsKey(att, kCMSampleAttachmentKey_NotSync);
         }
         CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
-        int64_t ms = (int64_t) llround(CMTimeGetSeconds(pts) * 1000.0);
+        int64_t msAbs = (int64_t) llround(CMTimeGetSeconds(pts) * 1000.0);
 
-        // Extract SPS/PPS once from format desc then send as extradata to RTMP
+        // Extract SPS/PPS once
         if (self->spsppsSize == 0) {
             CMFormatDescriptionRef fmtDesc = CMSampleBufferGetFormatDescription(sampleBuffer);
             if (fmtDesc) {
@@ -65,15 +121,15 @@ struct streaming::LiveStreamer::Impl {
                     CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmtDesc, 1, &ppsPtr, &ppsSize, &count, &nalHdrLen) == noErr &&
                     spsPtr && ppsPtr && spsSize > 3) {
                     juce::MemoryOutputStream avcc(256);
-                    avcc.writeByte(1); // configurationVersion
-                    avcc.writeByte(spsPtr[1]); // profile
-                    avcc.writeByte(spsPtr[2]); // compatibility
-                    avcc.writeByte(spsPtr[3]); // level
-                    avcc.writeByte(0xFC | 3); // lengthSizeMinusOne (4 bytes)
-                    avcc.writeByte(0xE0 | 1); // numOfSPS = 1
+                    avcc.writeByte(1);
+                    avcc.writeByte(spsPtr[1]);
+                    avcc.writeByte(spsPtr[2]);
+                    avcc.writeByte(spsPtr[3]);
+                    avcc.writeByte(0xFC | 3);
+                    avcc.writeByte(0xE0 | 1);
                     avcc.writeShortBigEndian((short)spsSize);
                     avcc.write(spsPtr, spsSize);
-                    avcc.writeByte(1); // numOfPPS = 1
+                    avcc.writeByte(1);
                     avcc.writeShortBigEndian((short)ppsSize);
                     avcc.write(ppsPtr, ppsSize);
                     self->spsppsSize = (size_t)avcc.getDataSize();
@@ -85,14 +141,74 @@ struct streaming::LiveStreamer::Impl {
             }
         }
 
-        // Send AVCC payload directly (length-prefixed NALs) to FLV muxer
+        // Base PTS
+        if (!self->ptsBaseSet.load()) {
+            self->basePtsMs.store(msAbs);
+            self->ptsBaseSet.store(true);
+            self->wallStart = std::chrono::steady_clock::now();
+        }
+        int64_t relMs = msAbs - self->basePtsMs.load();
+        if (relMs < 0) relMs = 0;
+
+        // Emit frame (enqueue for paced sending)
         CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sampleBuffer);
         if (!bb) return;
         size_t totalLen = 0; char* dataPtr = nullptr;
         OSStatus st = CMBlockBufferGetDataPointer(bb, 0, nullptr, &totalLen, &dataPtr);
         if (st != noErr || totalLen == 0 || dataPtr == nullptr) return;
 
-        self->rtmp.writeVideoFrame(dataPtr, totalLen, ms, keyframe);
+        // If backlog is large, drop non-keyframes to avoid bursts
+        juce::int64 lastSent = self->lastVideoSentRelMs.load();
+        if (!keyframe && (relMs - lastSent) > 1000) {
+            LogMessage("VT: dropping non-keyframe due to backlog relMs=" + juce::String((int)relMs) + " lastSent=" + juce::String((int)lastSent));
+            return;
+        }
+
+        // Copy frame bytes as the CMBlockBuffer will not remain valid after callback
+        PendingFrame pf;
+        pf.bytes.allocate(totalLen, true);
+        memcpy(pf.bytes.getData(), dataPtr, totalLen);
+        pf.length = totalLen;
+        pf.ptsMs = relMs;
+        pf.keyframe = keyframe;
+        {
+            std::lock_guard<std::mutex> lk(self->pendingMutex);
+            self->pendingFrames.emplace_back(std::move(pf));
+        }
+
+        // Start pacing on first video if not started
+        if (!self->pacingStarted.load()) {
+            self->wallStart = std::chrono::steady_clock::now();
+            self->pacerTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
+            if (self->pacerTimer) {
+                // Pace according to cfg.fps (one frame period)
+                int32_t frameMs = (self->cfg.fps > 0 ? (int32_t) llround(1000.0 / (double) self->cfg.fps) : 33);
+                dispatch_source_set_timer(self->pacerTimer, dispatch_time(DISPATCH_TIME_NOW, 0), (uint64_t)(frameMs * NSEC_PER_MSEC), (uint64_t)(1 * NSEC_PER_MSEC));
+                dispatch_source_set_event_handler(self->pacerTimer, ^{
+                    auto now = std::chrono::steady_clock::now();
+                    juce::int64 elapsedMs = (juce::int64) std::chrono::duration_cast<std::chrono::milliseconds>(now - self->wallStart).count();
+                    int sentThisTick = 0;
+                    while (sentThisTick < 1) {
+                        PendingFrame next;
+                        {
+                            std::lock_guard<std::mutex> lk(self->pendingMutex);
+                            if (self->pendingFrames.empty()) break;
+                            // Only send when its PTS is due
+                            if (self->pendingFrames.front().ptsMs > elapsedMs) break;
+                            next = std::move(self->pendingFrames.front());
+                            self->pendingFrames.pop_front();
+                        }
+                        // Send
+                        if (self->rtmp.writeVideoFrame(next.bytes.getData(), next.length, next.ptsMs, next.keyframe)) {
+                            self->lastVideoSentRelMs.store(next.ptsMs);
+                        }
+                        ++sentThisTick;
+                    }
+                });
+                dispatch_resume(self->pacerTimer);
+                self->pacingStarted.store(true);
+            }
+        }
     }
 
     bool initVideoEncoder() {
@@ -108,25 +224,53 @@ struct streaming::LiveStreamer::Impl {
         int32_t fps = cfg.fps;
         CFNumberRef fpsNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &fps);
         VTSessionSetProperty(vt, kVTCompressionPropertyKey_ExpectedFrameRate, fpsNum); vtRelease(fpsNum);
-        int32_t bps = cfg.videoBitrateKbps * 1000;
-        CFNumberRef br = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &bps);
+        // Bitrate ramp: start lower to stabilize ingest, then raise to target
+        int32_t bpsTarget = cfg.videoBitrateKbps * 1000;
+        int32_t bpsInitial = (int32_t) std::lround((double) bpsTarget * 0.6);
+        CFNumberRef br = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &bpsInitial);
         VTSessionSetProperty(vt, kVTCompressionPropertyKey_AverageBitRate, br); vtRelease(br);
-        int32_t keyint = cfg.keyframeIntervalSec * fps;
-        CFNumberRef gop = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &keyint);
-        VTSessionSetProperty(vt, kVTCompressionPropertyKey_MaxKeyFrameInterval, gop); vtRelease(gop);
+        // Short initial GOP (1s) for faster detection, will switch later
+        int32_t keyintInitial = fps;
+        CFNumberRef gopInit = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &keyintInitial);
+        VTSessionSetProperty(vt, kVTCompressionPropertyKey_MaxKeyFrameInterval, gopInit); vtRelease(gopInit);
+        // Real-time low-latency dials
         VTSessionSetProperty(vt, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
         VTSessionSetProperty(vt, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
-        // Profile/Level
-        VTSessionSetProperty(vt, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_4_1);
-        // Constrain data rate window
-        CFNumberRef maxr = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &bps);
-        VTSessionSetProperty(vt, kVTCompressionPropertyKey_DataRateLimits, (CFTypeRef)@[(__bridge NSNumber*)maxr, @(1)]);
-        vtRelease(maxr);
+        VTSessionSetProperty(vt, kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue);
+        int32_t maxDelay = 1; CFNumberRef md = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &maxDelay);
+        VTSessionSetProperty(vt, kVTCompressionPropertyKey_MaxFrameDelayCount, md); vtRelease(md);
+        // Profile/Level (Facebook 1080p60 needs 4.2; otherwise 4.1)
+        CFStringRef level = (cfg.fps >= 60 && cfg.videoHeight >= 1080)
+            ? kVTProfileLevel_H264_High_4_2
+            : kVTProfileLevel_H264_High_4_1;
+        VTSessionSetProperty(vt, kVTCompressionPropertyKey_ProfileLevel, level);
+        // Constrain data rate window (per-second). This property expects BYTES/sec and a window in seconds.
+        NSNumber* bytesPerSecInit = @(bpsInitial / 8);
+        NSNumber* windowSec = @(1);
+        VTSessionSetProperty(vt, kVTCompressionPropertyKey_DataRateLimits, (__bridge CFArrayRef)@[bytesPerSecInit, windowSec]);
 
         st = VTCompressionSessionPrepareToEncodeFrames(vt);
         if (st != noErr) { LogMessage("VT: prepare failed"); return false; }
         vtReady.store(true);
         LogMessage("VT: ready");
+
+        // After 2s, switch to configured GOP (2s by default)
+        int32_t keyintFinal = cfg.keyframeIntervalSec * fps;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            if (!vt) return;
+            CFNumberRef gopFinal = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &keyintFinal);
+            VTSessionSetProperty(vt, kVTCompressionPropertyKey_MaxKeyFrameInterval, gopFinal); vtRelease(gopFinal);
+        });
+
+        // After 5s, raise to target bitrate and update data rate window
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            if (!vt) return;
+            CFNumberRef brFinal = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &bpsTarget);
+            VTSessionSetProperty(vt, kVTCompressionPropertyKey_AverageBitRate, brFinal); vtRelease(brFinal);
+            NSNumber* bytesPerSecFinal = @(bpsTarget / 8);
+            NSNumber* windowSecFinal = @(1);
+            VTSessionSetProperty(vt, kVTCompressionPropertyKey_DataRateLimits, (__bridge CFArrayRef)@[bytesPerSecFinal, windowSecFinal]);
+        });
         return true;
     }
 
@@ -141,16 +285,13 @@ struct streaming::LiveStreamer::Impl {
         outFmt = [[AVAudioFormat alloc] initWithSettings:settings];
         converter = [[AVAudioConverter alloc] initFromFormat:inFmt toFormat:outFmt];
         if (!converter) { LogMessage("AAC: converter create failed"); return false; }
-        // Try to get AudioSpecificConfig (magic cookie) from output format
         NSData* cookie = [outFmt magicCookie];
         if (cookie && cookie.length > 0) {
             rtmp.setAudioConfig(cookie.bytes, (size_t) cookie.length);
             LogMessage("AAC: sent magic cookie ASC size=" + juce::String((int)cookie.length));
         } else {
-            // Build minimal ASC for AAC-LC (object type 2)
             auto sr = (int) cfg.audioSampleRate;
-            int sfi = 4; // default 44100
-            const int srTable[] = {96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000,7350};
+            int sfi = 4; const int srTable[] = {96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000,7350};
             for (int i = 0; i < (int)(sizeof(srTable)/sizeof(srTable[0])); ++i) { if (srTable[i] == sr) { sfi = i; break; } }
             int ch = juce::jlimit(1, 2, (int) cfg.audioChannels);
             uint8_t asc[2];
@@ -177,6 +318,10 @@ bool LiveStreamer::start(const StreamingConfig& cfg) {
     impl->active.store(true);
     impl->sentFirstVideo = false;
     impl->aacQueue = dispatch_queue_create("live.aac.queue", DISPATCH_QUEUE_SERIAL);
+    impl->ptsBaseSet.store(false);
+    impl->basePtsMs.store(0);
+    impl->audioPtsMs = 0;
+        impl->startAudioPacingIfNeeded();
 #endif
     return true;
 }
@@ -184,6 +329,16 @@ bool LiveStreamer::start(const StreamingConfig& cfg) {
 void LiveStreamer::stop() {
 #if JUCE_MAC
     impl->active.store(false);
+    if (impl->pacerTimer) { dispatch_source_cancel(impl->pacerTimer); impl->pacerTimer = nullptr; }
+    if (impl->audioTimer) { dispatch_source_cancel(impl->audioTimer); impl->audioTimer = nullptr; }
+    {
+        std::lock_guard<std::mutex> lk(impl->pendingMutex);
+        impl->pendingFrames.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk2(impl->audioMutex);
+        impl->pendingAudio.clear();
+    }
     if (impl->vt) { VTCompressionSessionInvalidate(impl->vt); CFRelease(impl->vt); impl->vt = nullptr; }
     impl->converter = nil; impl->inFmt = nil; impl->outFmt = nil;
     impl->aacQueue = nullptr;
@@ -195,7 +350,7 @@ void LiveStreamer::pushAudioPCM(const juce::AudioBuffer<float>& buffer, int numS
     juce::ignoreUnused(sampleRate, numChannels);
 #if JUCE_MAC
     if (!impl->active.load() || !impl->converter || !impl->inFmt || !impl->outFmt || impl->aacQueue == nullptr) return;
-    // Copy to an AVAudioPCMBuffer and encode on background queue to avoid audio thread work
+    if (!impl->ptsBaseSet.load()) return;
     AVAudioPCMBuffer* inBuf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:impl->inFmt frameCapacity:(AVAudioFrameCount) numSamples];
     inBuf.frameLength = (AVAudioFrameCount) numSamples;
     const int ch = juce::jmin(buffer.getNumChannels(), (int) impl->inFmt.channelCount);
@@ -206,8 +361,9 @@ void LiveStreamer::pushAudioPCM(const juce::AudioBuffer<float>& buffer, int numS
     impl->audioPtsMs += (int64_t) llround(1000.0 * (double) numSamples / (double) impl->cfg.audioSampleRate);
     AVAudioFormat* outFmt = impl->outFmt;
     AVAudioConverter* conv = impl->converter;
-    FfmpegRtmpWriter* writer = &impl->rtmp;
     std::atomic<bool>* activePtr = &impl->active;
+    std::deque<Impl::PendingAudio>* pendingAudio = &impl->pendingAudio;
+    std::mutex* audioMutex = &impl->audioMutex;
     dispatch_async(impl->aacQueue, ^{
         if (!conv) return;
         AVAudioCompressedBuffer* outBuf = [[AVAudioCompressedBuffer alloc] initWithFormat:outFmt packetCapacity:512 maximumPacketSize:2048];
@@ -219,7 +375,15 @@ void LiveStreamer::pushAudioPCM(const juce::AudioBuffer<float>& buffer, int numS
         }];
         if (st == AVAudioConverterOutputStatus_Error || err) { LogMessage("AAC: convert failed"); return; }
         if (!activePtr->load()) return;
-        if (outBuf.byteLength > 0) writer->writeAudioFrame(outBuf.data, outBuf.byteLength, ptsMs);
+        if (outBuf.byteLength > 0) {
+            Impl::PendingAudio pa;
+            pa.bytes.allocate(outBuf.byteLength, true);
+            memcpy(pa.bytes.getData(), outBuf.data, outBuf.byteLength);
+            pa.length = outBuf.byteLength;
+            pa.ptsMs = ptsMs;
+            std::lock_guard<std::mutex> lk(*audioMutex);
+            pendingAudio->emplace_back(std::move(pa));
+        }
     });
 #endif
 }
@@ -244,3 +408,5 @@ void LiveStreamer::pushPixelBuffer(void* cvPixelBufferRef, int64_t ptsMs) {
     juce::ignoreUnused(cvPixelBufferRef, ptsMs);
 #endif
 }
+
+// (removed static duplicate: audio pacing implemented as Impl::startAudioPacingIfNeeded)
