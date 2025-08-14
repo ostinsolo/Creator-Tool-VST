@@ -20,14 +20,14 @@
 
 #if HAVE_FFMPEG
 extern "C" {
- #include <libavformat/avformat.h>
+  #include <libavformat/avformat.h>
  #include <libavutil/avutil.h>
  #include <libavcodec/avcodec.h>
  #include <libavutil/opt.h>
 }
 
 // Forward declaration so member methods can call it
-static inline void ff_try_write_header_internal(AVFormatContext* fmt, bool haveVideoConfig, bool& headerWritten, AVDictionary** muxerOpts);
+static inline void ff_try_write_header_internal(AVFormatContext* fmt, bool haveVideoConfig, bool haveAudioConfig, bool& headerWritten, AVDictionary** muxerOpts);
 
 static inline juce::String ff_err2str(int err) {
     char buf[AV_ERROR_MAX_STRING_SIZE] = {0};
@@ -74,6 +74,7 @@ struct FfmpegRtmpWriter::Impl {
     int videoWidth { 1920 };
     int videoHeight { 1080 };
     int audioSampleRate { 48000 };
+    int audioChannels { 2 };
     int fps { 30 };
     int videoBitrateKbps { 2500 };
     int audioBitrateKbps { 128 };
@@ -351,7 +352,7 @@ struct FfmpegRtmpWriter::Impl {
             // Send via FFmpeg
             std::lock_guard<std::mutex> lk(g_ffmpegWriteMutex);
             if (!isOpen.load()) continue;
-            ff_try_write_header_internal(fmt, haveVideoConfig, headerWritten, &muxerOpts);
+            ff_try_write_header_internal(fmt, haveVideoConfig, haveAudioConfig, headerWritten, &muxerOpts);
             if (!headerWritten) continue;
             AVPacket avpkt{}; av_init_packet(&avpkt);
             avpkt.data = pkt.bytes.data(); avpkt.size = (int) pkt.bytes.size();
@@ -370,9 +371,9 @@ FfmpegRtmpWriter::FfmpegRtmpWriter() : impl(std::make_unique<Impl>()) {}
 FfmpegRtmpWriter::~FfmpegRtmpWriter() { close(); }
 
 #if HAVE_FFMPEG
-static inline void ff_try_write_header_internal(AVFormatContext* fmt, bool haveVideoConfig, bool& headerWritten, AVDictionary** muxerOpts) {
+static inline void ff_try_write_header_internal(AVFormatContext* fmt, bool haveVideoConfig, bool haveAudioConfig, bool& headerWritten, AVDictionary** muxerOpts) {
     if (!fmt || headerWritten) return;
-    if (!haveVideoConfig) return;
+    if (!haveVideoConfig && !haveAudioConfig) return;
     if (avformat_write_header(fmt, muxerOpts) < 0) {
         LogMessage("FFMPEG: write_header failed");
         return;
@@ -476,7 +477,7 @@ bool FfmpegRtmpWriter::setVideoConfig(const void* data, size_t size) {
     impl->vExtra.setSize(size, false);
     memcpy(impl->vExtra.getData(), data, size);
     LogMessage("FFMPEG: video extradata set (SPS/PPS) size=" + juce::String((int)size));
-    ff_try_write_header_internal(impl->fmt, impl->haveVideoConfig, impl->headerWritten, &impl->muxerOpts);
+    ff_try_write_header_internal(impl->fmt, impl->haveVideoConfig, impl->haveAudioConfig, impl->headerWritten, &impl->muxerOpts);
     return true;
 #else
     juce::ignoreUnused(data, size);
@@ -498,7 +499,7 @@ bool FfmpegRtmpWriter::setAudioConfig(const void* data, size_t size) {
     impl->aExtra.setSize(size, false);
     memcpy(impl->aExtra.getData(), data, size);
     LogMessage("FFMPEG: audio extradata set (ASC) size=" + juce::String((int)size));
-    ff_try_write_header_internal(impl->fmt, impl->haveVideoConfig, impl->headerWritten, &impl->muxerOpts);
+    ff_try_write_header_internal(impl->fmt, impl->haveVideoConfig, impl->haveAudioConfig, impl->headerWritten, &impl->muxerOpts);
     return true;
 #else
     juce::ignoreUnused(data, size);

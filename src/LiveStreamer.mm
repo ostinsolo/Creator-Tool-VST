@@ -107,8 +107,7 @@ struct streaming::LiveStreamer::Impl {
             CFDictionaryRef att = (CFDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
             keyframe = !CFDictionaryContainsKey(att, kCMSampleAttachmentKey_NotSync);
         }
-        CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
-        int64_t msAbs = (int64_t) llround(CMTimeGetSeconds(pts) * 1000.0);
+        // We will generate a CFR timeline; ignore capture PTS
 
         // Extract SPS/PPS once
         if (self->spsppsSize == 0) {
@@ -141,14 +140,14 @@ struct streaming::LiveStreamer::Impl {
             }
         }
 
-        // Base PTS
+        // Base PTS and CFR counter
         if (!self->ptsBaseSet.load()) {
-            self->basePtsMs.store(msAbs);
             self->ptsBaseSet.store(true);
             self->wallStart = std::chrono::steady_clock::now();
+            self->lastVideoSentRelMs.store(0);
         }
-        int64_t relMs = msAbs - self->basePtsMs.load();
-        if (relMs < 0) relMs = 0;
+        const int frameMs = (self->cfg.fps > 0 ? (int) llround(1000.0 / (double) self->cfg.fps) : 33);
+        int64_t relMs = self->lastVideoSentRelMs.load() + frameMs;
 
         // Emit frame (enqueue for paced sending)
         CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sampleBuffer);
@@ -376,13 +375,21 @@ void LiveStreamer::pushAudioPCM(const juce::AudioBuffer<float>& buffer, int numS
         if (st == AVAudioConverterOutputStatus_Error || err) { LogMessage("AAC: convert failed"); return; }
         if (!activePtr->load()) return;
         if (outBuf.byteLength > 0) {
-            Impl::PendingAudio pa;
-            pa.bytes.allocate(outBuf.byteLength, true);
-            memcpy(pa.bytes.getData(), outBuf.data, outBuf.byteLength);
-            pa.length = outBuf.byteLength;
-            pa.ptsMs = ptsMs;
-            std::lock_guard<std::mutex> lk(*audioMutex);
-            pendingAudio->emplace_back(std::move(pa));
+            AVAudioPacketCount pc = outBuf.packetCount;
+            const AudioStreamPacketDescription* pds = outBuf.packetDescriptions;
+            const int64_t packetDurMs = (int64_t) llround(1024.0 * 1000.0 / (double) impl->cfg.audioSampleRate);
+            uint8_t* base = (uint8_t*) outBuf.data;
+            for (AVAudioPacketCount i = 0; i < pc; ++i) {
+                size_t offs = (size_t) pds[i].mStartOffset;
+                size_t sz   = (size_t) pds[i].mDataByteSize;
+                Impl::PendingAudio pa;
+                pa.bytes.allocate(sz, true);
+                memcpy(pa.bytes.getData(), base + offs, sz);
+                pa.length = sz;
+                pa.ptsMs = ptsMs + (int64_t) i * packetDurMs;
+                std::lock_guard<std::mutex> lk(*audioMutex);
+                pendingAudio->emplace_back(std::move(pa));
+            }
         }
     });
 #endif
