@@ -8,6 +8,8 @@
 #include <juce_core/juce_core.h>
 #include "AudioRecorder.h"
 #include "ScreenRecorder.h"
+#include "StreamingConfig.h"
+#include "LiveStreamer.h"
 
 class CreatorToolVSTAudioProcessor : public juce::AudioProcessor {
 public:
@@ -49,6 +51,11 @@ public:
     void stopCombinedRecording() { screenRecorder.stop(); }
     bool isScreenRecording() const { return screenRecorder.isRecording(); }
 
+    // Live streaming
+    bool startLiveStreaming(const StreamingConfig& cfg);
+    void stopLiveStreaming();
+    bool isLiveStreaming() const { return liveActive; }
+
     // Capture options
     void setCaptureResolution(int width, int height) { screenRecorder.setCaptureResolution(width, height); }
 
@@ -59,6 +66,10 @@ public:
 private:
     AudioRecorder audioRecorder;
     ScreenRecorder screenRecorder;
+    std::unique_ptr<streaming::LiveStreamer> liveStreamer;
+    StreamingConfig liveCfg;
+    bool liveActive { false };
+
     juce::File destinationDirectory;
     juce::File lastRecordedFile;
     double currentSampleRate { 44100.0 };

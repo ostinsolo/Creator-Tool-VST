@@ -2,6 +2,7 @@
 #include "PluginProcessor.h"
 #include "MuxUtils.h"
 #include "Logging.h"
+#include "StreamingConfig.h"
 #include <chrono>
 #include <ctime>
 
@@ -26,7 +27,7 @@ static juce::String makeTimestampedFilename(const juce::String& ext) {
 CreatorToolVSTAudioProcessorEditor::CreatorToolVSTAudioProcessorEditor(CreatorToolVSTAudioProcessor& p)
     : juce::AudioProcessorEditor(&p), processor(p)
 {
-    setSize(560, 450);
+    setSize(560, 520);
 
     addAndMakeVisible(recordButton);
     addAndMakeVisible(stopButton);
@@ -54,6 +55,12 @@ CreatorToolVSTAudioProcessorEditor::CreatorToolVSTAudioProcessorEditor(CreatorTo
     formatBox.addListener(this);
     addAndMakeVisible(formatBox);
 
+    // Live UI
+    rtmpUrlEdit.setText("rtmps://live-api.facebook.com:443/rtmp/your-key", juce::dontSendNotification);
+    addAndMakeVisible(rtmpUrlEdit);
+    addAndMakeVisible(goLiveButton);
+    addAndMakeVisible(stopLiveButton);
+
     addAndMakeVisible(folderLabel);
     addAndMakeVisible(statusLabel);
 
@@ -70,6 +77,9 @@ CreatorToolVSTAudioProcessorEditor::CreatorToolVSTAudioProcessorEditor(CreatorTo
     bothRecordButton.onClick = [this]() { buttonClicked(&bothRecordButton); };
     bothStopButton.onClick = [this]() { buttonClicked(&bothStopButton); };
 
+    goLiveButton.onClick = [this]() { buttonClicked(&goLiveButton); };
+    stopLiveButton.onClick = [this]() { buttonClicked(&stopLiveButton); };
+
     folderLabel.setJustificationType(juce::Justification::centred);
     statusLabel.setJustificationType(juce::Justification::centred);
 
@@ -83,7 +93,7 @@ void CreatorToolVSTAudioProcessorEditor::paint(juce::Graphics& g) {
     g.fillAll(getLookAndFeel().findColour(juce::ResizableWindow::backgroundColourId));
     g.setColour(juce::Colours::white);
     g.setFont(16.0f);
-    g.drawFittedText("Creator Tool VST — Audio+Screen Recorder", getLocalBounds().removeFromTop(24), juce::Justification::centred, 1);
+    g.drawFittedText("Creator Tool VST — Audio+Screen Recorder + Live", getLocalBounds().removeFromTop(24), juce::Justification::centred, 1);
 }
 
 void CreatorToolVSTAudioProcessorEditor::resized() {
@@ -106,6 +116,11 @@ void CreatorToolVSTAudioProcessorEditor::resized() {
     auto optsRow = area.removeFromTop(36);
     resolutionBox.setBounds(optsRow.removeFromLeft(180).reduced(2));
     formatBox.setBounds(optsRow.removeFromLeft(100).reduced(2));
+
+    auto liveRow = area.removeFromTop(36);
+    rtmpUrlEdit.setBounds(liveRow.removeFromLeft(300).reduced(2));
+    goLiveButton.setBounds(liveRow.removeFromLeft(100).reduced(2));
+    stopLiveButton.setBounds(liveRow.removeFromLeft(100).reduced(2));
 
     area.removeFromTop(6);
 
@@ -238,6 +253,36 @@ void CreatorToolVSTAudioProcessorEditor::buttonClicked(juce::Button* button) {
         LogMessage("UI: A+V record stop");
        #else
         statusLabel.setText("A+V not supported on this platform", juce::dontSendNotification);
+       #endif
+        updateButtons();
+        return;
+    }
+
+    if (button == &goLiveButton) {
+       #if JUCE_MAC
+        StreamingConfig cfg;
+        cfg.rtmpUrl = rtmpUrlEdit.getText();
+        cfg.videoWidth = 1920; cfg.videoHeight = 1080; cfg.fps = 30; cfg.videoBitrateKbps = 6000; cfg.keyframeIntervalSec = 2;
+        cfg.audioSampleRate = 48000; cfg.audioChannels = 2; cfg.audioBitrateKbps = 160;
+        if (processor.startLiveStreaming(cfg)) {
+            statusLabel.setText("Live: connected", juce::dontSendNotification);
+            LogMessage("UI: Go Live -> " + cfg.rtmpUrl);
+        } else {
+            statusLabel.setText("Live: failed to start", juce::dontSendNotification);
+        }
+       #else
+        statusLabel.setText("Live: not supported on this platform", juce::dontSendNotification);
+       #endif
+        updateButtons();
+        return;
+    }
+
+    if (button == &stopLiveButton) {
+       #if JUCE_MAC
+        processor.stopLiveStreaming();
+        statusLabel.setText("Live: stopped", juce::dontSendNotification);
+       #else
+        statusLabel.setText("Live: not supported on this platform", juce::dontSendNotification);
        #endif
         updateButtons();
         return;

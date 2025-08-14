@@ -36,6 +36,11 @@ private:
     juce::ComboBox resolutionBox;
     juce::ComboBox formatBox; // MOV/MP4
 
+    // Live streaming controls
+    juce::TextEditor rtmpUrlEdit;
+    juce::TextButton goLiveButton { "Go Live" };
+    juce::TextButton stopLiveButton { "Stop Live" };
+
     juce::Label folderLabel;
     juce::Label statusLabel;
 

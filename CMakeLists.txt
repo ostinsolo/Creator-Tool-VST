@@ -48,6 +48,14 @@ if(APPLE)
 endif()
 
 target_sources(CreatorToolVST PRIVATE ${PLUGIN_SOURCES})
+target_sources(CreatorToolVST PRIVATE
+    src/StreamingConfig.h
+    src/FlvMuxer.h
+    src/RtmpClient.h
+    src/LiveStreamer.h
+    src/LiveStreamer.mm
+    src/FfmpegRtmpWriter.h
+)
 
 if(APPLE)
     # Explicitly add MuxUtils.mm to avoid glob issues
@@ -104,5 +112,23 @@ if(APPLE)
     set_source_files_properties(src/MuxUtils.mm PROPERTIES LANGUAGE OBJCXX)
     set_source_files_properties(src/MuxUtils.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
     # Link required frameworks; ScreenCaptureKit provided since macOS 12.3
-    target_link_libraries(CreatorToolVST PRIVATE "-framework AVFoundation" "-framework AppKit" "-framework CoreMedia" "-framework AVKit" "-framework ScreenCaptureKit")
+    target_link_libraries(CreatorToolVST PRIVATE "-framework AVFoundation" "-framework AppKit" "-framework CoreMedia" "-framework AVKit" "-framework ScreenCaptureKit" "-framework VideoToolbox" "-framework AudioToolbox")
+
+    # Optional FFmpeg (Pro streaming). Set HAVE_FFMPEG if found.
+    find_path(FFMPEG_INCLUDE_DIR libavformat/avformat.h 
+        PATHS /usr/local/include /opt/homebrew/include ${CMAKE_SOURCE_DIR}/external/ffmpeg/include)
+    find_library(AVFORMAT_LIBRARY avformat 
+        PATHS /usr/local/lib /opt/homebrew/lib ${CMAKE_SOURCE_DIR}/external/ffmpeg/lib)
+    find_library(AVUTIL_LIBRARY avutil 
+        PATHS /usr/local/lib /opt/homebrew/lib ${CMAKE_SOURCE_DIR}/external/ffmpeg/lib)
+    find_library(AVCODEC_LIBRARY avcodec 
+        PATHS /usr/local/lib /opt/homebrew/lib ${CMAKE_SOURCE_DIR}/external/ffmpeg/lib)
+    if (FFMPEG_INCLUDE_DIR AND AVFORMAT_LIBRARY AND AVUTIL_LIBRARY AND AVCODEC_LIBRARY)
+        target_compile_definitions(CreatorToolVST PRIVATE HAVE_FFMPEG=1)
+        target_include_directories(CreatorToolVST PRIVATE ${FFMPEG_INCLUDE_DIR})
+        target_link_libraries(CreatorToolVST PRIVATE ${AVFORMAT_LIBRARY} ${AVUTIL_LIBRARY} ${AVCODEC_LIBRARY})
+        message(STATUS "FFmpeg found; enabling Pro RTMP writer")
+    else()
+        message(STATUS "FFmpeg not found; Pro RTMP writer disabled")
+    endif()
 endif()

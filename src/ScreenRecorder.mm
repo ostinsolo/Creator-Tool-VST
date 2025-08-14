@@ -61,6 +61,7 @@ struct ScreenRecorder::Impl {
     SCStream* scStream = nil;
     JUCEStreamOutputBridge* scOutput = nil;
     dispatch_queue_t scQueue = nullptr;
+    std::function<void(void* cvPixelBufferRef, int64_t ptsMs)> frameCallback;
     AVAssetWriter* writer = nil;
     AVAssetWriterInput* videoInput = nil;
     AVAssetWriterInputPixelBufferAdaptor* videoAdaptor = nil;
@@ -162,11 +163,16 @@ struct ScreenRecorder::Impl {
 
     static BOOL handleSample(void* selfPtr, CMSampleBufferRef sbuf) {
         Impl* self = (Impl*) selfPtr;
-        if (!self->running.load() || self->writer == nil) return NO;
+        if (!self->running.load()) return NO;
         CVImageBufferRef pix = CMSampleBufferGetImageBuffer(sbuf);
         if (pix == nullptr) return NO;
         CMTime pts = CMSampleBufferGetPresentationTimeStamp(sbuf);
         if (!CMTIME_IS_VALID(self->baseVideoPTS)) self->baseVideoPTS = pts;
+        if (self->frameCallback) {
+            int64_t ms = (int64_t) llround(CMTimeGetSeconds(pts) * 1000.0);
+            self->frameCallback((void*)pix, ms);
+        }
+        if (self->writer == nil) return YES; // stream-only mode
         if (!self->startedWriting) {
             [self->writer startWriting];
             [self->writer startSessionAtSourceTime:pts];
@@ -309,6 +315,45 @@ struct ScreenRecorder::Impl {
    #endif
     }
 
+    bool startSCStreamOnly() {
+   #if HAVE_SCKIT
+        if (!canUseScreenCaptureKit()) return false;
+        SCDisplay* display = pickMainDisplay();
+        if (display == nil) { LogMessage("SCK: no display found"); return false; }
+        NSError* err = nil;
+        SCStreamConfiguration* cfg = [SCStreamConfiguration new];
+        cfg.showsCursor = YES;
+        cfg.queueDepth = 8;
+        CGSize size = display.frame.size;
+        if (desiredWidth.load() > 0 && desiredHeight.load() > 0) {
+            size.width = desiredWidth.load();
+            size.height = desiredHeight.load();
+        }
+        if (size.width <= 0 || size.height <= 0) { size.width = 1280; size.height = 720; }
+        cfg.width = size.width; cfg.height = size.height;
+        SCContentFilter* filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
+
+        scStream = [[SCStream alloc] initWithFilter:filter configuration:cfg delegate:nil];
+        scQueue = dispatch_queue_create("scstream.queue", DISPATCH_QUEUE_SERIAL);
+        scOutput = [JUCEStreamOutputBridge new];
+        struct Shim { BOOL (*cb)(void*, CMSampleBufferRef); void* selfPtr; };
+        Shim* shim = (Shim*)malloc(sizeof(Shim)); shim->cb = &Impl::handleSample; shim->selfPtr = this; scOutput.cppImplPtr = shim;
+        [scStream addStreamOutput:scOutput type:SCStreamOutputTypeScreen sampleHandlerQueue:scQueue error:&err];
+        if (err) { LogMessage("SCK: addStreamOutput error -> " + juce::String([[err localizedDescription] UTF8String])); return false; }
+        combined.store(false);
+        audioSamplesPushed = 0;
+        baseVideoPTS = kCMTimeInvalid;
+        running.store(true);
+        [scStream startCaptureWithCompletionHandler:^(NSError * _Nullable error) {
+            if (error != nil) { LogMessage("SCK: startCapture error -> " + juce::String([[error localizedDescription] UTF8String])); running.store(false); }
+            else { LogMessage("SCK: startCapture completed (stream-only)"); }
+        }];
+        return true;
+   #else
+        return false;
+   #endif
+    }
+
     bool startSCVideoOnly(const juce::File& outFile) {
    #if HAVE_SCKIT
         if (!canUseScreenCaptureKit()) return false;
@@ -354,6 +399,15 @@ struct ScreenRecorder::Impl {
         }
         LogMessage("startCombined: SCK not available");
         return false;
+    }
+
+    bool startStreamOnly() {
+        if (running.load()) { LogMessage("startStreamOnly: already running"); return false; }
+       #if HAVE_SCKIT
+        return this->startSCStreamOnly();
+       #else
+        return false;
+       #endif
     }
 
     void pushAudio(const juce::AudioBuffer<float>& buffer, int numSamples, double sampleRate, int numChannels) {
@@ -435,6 +489,10 @@ bool ScreenRecorder::startCombined(const juce::File& outputFile, double sampleRa
     return impl->startCombined(outputFile, sampleRate, numChannels);
 }
 
+bool ScreenRecorder::startStreamOnly() {
+    return impl->startStreamOnly();
+}
+
 void ScreenRecorder::pushAudio(const juce::AudioBuffer<float>& buffer, int numSamples, double sampleRate, int numChannels) {
     impl->pushAudio(buffer, numSamples, sampleRate, numChannels);
 }
@@ -442,6 +500,10 @@ void ScreenRecorder::pushAudio(const juce::AudioBuffer<float>& buffer, int numSa
 void ScreenRecorder::setCaptureResolution(int width, int height) {
     impl->desiredWidth.store(width);
     impl->desiredHeight.store(height);
+}
+
+void ScreenRecorder::setFrameCallback(std::function<void(void* cvPixelBufferRef, int64_t ptsMs)> cb) {
+    impl->frameCallback = std::move(cb);
 }
 
 void ScreenRecorder::stop() {

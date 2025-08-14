@@ -52,6 +52,11 @@ void CreatorToolVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer
     if (screenRecorder.isRecording()) {
         screenRecorder.pushAudio(buffer, buffer.getNumSamples(), currentSampleRate, getTotalNumInputChannels());
     }
+
+    // Live audio feed
+    if (liveActive && liveStreamer) {
+        liveStreamer->pushAudioPCM(buffer, buffer.getNumSamples(), currentSampleRate, getTotalNumInputChannels());
+    }
 }
 
 juce::AudioProcessorEditor* CreatorToolVSTAudioProcessor::createEditor() {
@@ -97,6 +102,40 @@ void CreatorToolVSTAudioProcessor::stopRecording() {
 
 void CreatorToolVSTAudioProcessor::setDestinationDirectory(const juce::File& dir) {
     destinationDirectory = dir;
+}
+
+bool CreatorToolVSTAudioProcessor::startLiveStreaming(const StreamingConfig& cfg) {
+   #if JUCE_MAC
+    if (liveActive) return true;
+    liveCfg = cfg;
+    liveStreamer.reset(new streaming::LiveStreamer());
+    if (!liveStreamer->start(liveCfg)) { liveStreamer.reset(); return false; }
+    // Bridge frames from ScreenRecorder into LiveStreamer
+    screenRecorder.setFrameCallback([this](void* pix, int64_t ptsMs){ if (liveActive && liveStreamer) liveStreamer->pushPixelBuffer(pix, ptsMs); });
+    // Start stream-only capture (no writer) so frames flow to VT
+    if (!screenRecorder.startStreamOnly()) {
+        LogMessage("Live: failed to start stream-only capture");
+        liveStreamer->stop(); liveStreamer.reset();
+        return false;
+    }
+    liveActive = true;
+    LogMessage("Live: started");
+    return true;
+   #else
+    juce::ignoreUnused(cfg);
+    return false;
+   #endif
+}
+
+void CreatorToolVSTAudioProcessor::stopLiveStreaming() {
+   #if JUCE_MAC
+    if (!liveActive) return;
+    screenRecorder.setFrameCallback(nullptr);
+    screenRecorder.stop();
+    if (liveStreamer) { liveStreamer->stop(); liveStreamer.reset(); }
+    liveActive = false;
+    LogMessage("Live: stopped");
+   #endif
 }
 
 //==============================================================================
